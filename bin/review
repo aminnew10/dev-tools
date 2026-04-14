@@ -5,7 +5,7 @@ default_base="main"
 requested_base="$default_base"
 requested_mr_url=""
 requested_review_branch=""
-mode="open"
+mode="prompt"
 include_duo="false"
 resolve_duo="false"
 comment_on_mr="false"
@@ -18,15 +18,14 @@ primary_mr_context_loaded="false"
 usage() {
   cat <<EOF
 Usage:
-  review [--open | --prompt] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<branch-name-or-merge-request-url>]
+  review [--copilot] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<branch-name-or-merge-request-url>]
   review --help
 
-Generate a Copilot review prompt for the current branch. By default, this opens
-Copilot with the generated prompt.
+Generate a Copilot review prompt for the current branch. By default, this prints
+the generated prompt. Use --copilot to pass it to GitHub Copilot CLI.
 
 Options:
-  --open                 Open Copilot with the generated prompt (default)
-  --prompt               Print the generated prompt instead of opening Copilot
+  --copilot              Pass the generated prompt to GitHub Copilot CLI
   --base <ref>           Compare against the given base branch, commit hash, or
                          GitLab merge request URL. Useful for stacked merge
                          requests. Default: $default_base
@@ -58,15 +57,17 @@ Notes:
 
 Examples:
   review
-    Open Copilot with a review prompt for the current branch against main.
+    Print a review prompt for the current branch against main.
+  review --copilot
+    Pass the generated prompt for the current branch against main to GitHub Copilot CLI.
   review --base feature/parent
-    Review the current branch against another branch for a stacked MR.
+    Print a review prompt for the current branch against another branch for a stacked MR.
   review feature/child
-    Fetch that remote branch, switch to it safely, and review it against main.
+    Fetch that remote branch, switch to it safely, and print the review prompt against main.
   review https://gitlab.com/group/project/-/merge_requests/124
-    Fetch that merge request, switch to its exact source branch state, and review it.
+    Fetch that merge request, switch to its exact source branch state, and print the review prompt.
   review --duo --comment
-    Include unresolved GitLab Duo comments for the current branch's open MR and ask Copilot to comment findings back on it.
+    Print a prompt that includes unresolved GitLab Duo comments for the current branch's open MR and asks Copilot to comment findings back on it.
 EOF
 }
 
@@ -551,11 +552,8 @@ load_primary_merge_request_for_current_branch() {
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --open)
-      mode="open"
-      ;;
-    --prompt)
-      mode="prompt"
+    --copilot)
+      mode="copilot"
       ;;
     --duo)
       include_duo="true"
@@ -771,8 +769,8 @@ if [ "$comment_on_mr" = "true" ]; then
   append_prompt "$comment_context"
 fi
 
-if [ "$mode" = "open" ]; then
-  require_command_with_help copilot "Install GitHub Copilot CLI or rerun with --prompt."
+if [ "$mode" = "copilot" ]; then
+  require_command_with_help copilot "Install GitHub Copilot CLI or rerun without --copilot."
   exec copilot -i "$prompt"
 fi
 
