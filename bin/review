@@ -51,14 +51,13 @@ Notes:
 
 Examples:
   review
-  review --prompt
-  review --base feature/parent --prompt
-  review --base https://gitlab.com/group/project/-/merge_requests/123 --prompt
+    Open Copilot with a review prompt for the current branch against main.
+  review --base feature/parent
+    Review the current branch against another branch for a stacked MR.
   review https://gitlab.com/group/project/-/merge_requests/124
-  review --duo
-  review --duo --resolve
-  review --comment
-  review https://gitlab.com/group/project/-/merge_requests/124 --duo --comment
+    Fetch that merge request, switch to its exact source branch state, and review it.
+  review --duo --comment
+    Include unresolved GitLab Duo comments for the current branch's open MR and ask Copilot to comment findings back on it.
 EOF
 }
 
