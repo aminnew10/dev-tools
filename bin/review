@@ -686,6 +686,8 @@ if [ "$primary_mr_context_loaded" = "true" ]; then
   append_prompt "$mr_context"
 fi
 
+gitlab_shell_safety_context=$(printf "If you use shell commands for GitLab API calls, the shell safety scanner rejects any command containing the literal \`\${\` sequence, even inside quoted text, heredocs, or embedded JavaScript. Do not use \`\${...}\` shell expansion, \`\${...}\` fallback expressions, or JavaScript template literals in commands. Use plain \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN references after checking which variable is exported, use simple string concatenation, and paraphrase any reply or comment text that would otherwise contain the exact \`\${\` sequence.")
+
 if [ "$include_duo" = "true" ]; then
   if ! discussions_json=$(gitlab_get "projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions?per_page=100"); then
     fail "failed to load merge request discussions for !${merge_request_iid}. Check that your token can read discussions."
@@ -747,7 +749,8 @@ if [ "$include_duo" = "true" ]; then
     ')
 
     if [ "$unresolved_duo_comments" -gt 0 ]; then
-      resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\nGitLab API for Duo replies:\n- Reply: POST %s/<discussion_id>/notes with form field body=<reply>\n- Resolve: PUT %s/<discussion_id>?resolved=true" \
+      resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\n%s\n\nGitLab API for Duo replies:\n- Reply: POST %s/<discussion_id>/notes with form field body=<reply>\n- Resolve: PUT %s/<discussion_id>?resolved=true\n- Use whichever of \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN is already exported; avoid inline fallback expressions." \
+        "$gitlab_shell_safety_context" \
         "$mr_discussions_endpoint" \
         "$mr_discussions_endpoint")
       append_prompt "$resolve_context"
@@ -758,7 +761,8 @@ if [ "$include_duo" = "true" ]; then
 fi
 
 if [ "$comment_on_mr" = "true" ]; then
-  comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: \$GITLAB_TOKEN (or \$GITLAB_ACCESS_TOKEN)\n- Form fields for added or changed lines:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[new_path]=<file path>\n  position[new_line]=<line number>\n- For removed lines, use old_path and old_line instead.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
+  comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\n%s\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: use whichever of \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN is already exported; avoid inline fallback expressions.\n- Required position fields for text diff comments:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[old_path]=<file path before the change>\n  position[new_path]=<file path after the change>\n  position[new_line]=<line number> for added or changed lines, or position[old_line]=<line number> for removed lines\n- When the file was not renamed, old_path and new_path are the same path.\n- If GitLab rejects the position, inspect the merge request diff metadata first and retry with a valid changed line instead of immediately falling back to a general note.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
+    "$gitlab_shell_safety_context" \
     "$mr_discussions_endpoint" \
     "$mr_base_sha" \
     "$mr_start_sha" \
