@@ -4,6 +4,7 @@ set -eu
 default_base="main"
 requested_base="$default_base"
 requested_mr_url=""
+requested_review_branch=""
 mode="open"
 include_duo="false"
 resolve_duo="false"
@@ -17,7 +18,7 @@ primary_mr_context_loaded="false"
 usage() {
   cat <<EOF
 Usage:
-  review [--open | --prompt] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<merge-request-url>]
+  review [--open | --prompt] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<branch-name-or-merge-request-url>]
   review --help
 
 Generate a Copilot review prompt for the current branch. By default, this opens
@@ -38,22 +39,30 @@ Options:
   -h, --help             Show this help text
 
 Arguments:
-  <merge-request-url>    Review the given GitLab merge request. The command will
-                         fetch the MR branch, switch to the exact source branch,
-                         and then start the review from that branch state
+  <branch-name-or-merge-request-url>
+                         Review the given remote branch or GitLab merge request.
+                         Branch reviews fetch the remote branch, switch to the
+                         local branch, and ensure it matches the remote exactly.
+                         Merge request reviews fetch the MR branch, switch to the
+                         exact source branch, and then start the review
 
 Notes:
   --resolve requires --duo.
   GitLab features (MR URLs, --duo, --comment, --resolve) require curl, jq, and
   GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
+  Branch and MR URL reviews require a clean working tree.
+  Existing local branches are only reused when they already match the fetched
+  remote branch or can be fast-forwarded to it.
   MR URL review requires a configured git remote that matches the MR source
-  project, and a clean working tree if a branch switch is needed.
+  project.
 
 Examples:
   review
     Open Copilot with a review prompt for the current branch against main.
   review --base feature/parent
     Review the current branch against another branch for a stacked MR.
+  review feature/child
+    Fetch that remote branch, switch to it safely, and review it against main.
   review https://gitlab.com/group/project/-/merge_requests/124
     Fetch that merge request, switch to its exact source branch state, and review it.
   review --duo --comment
@@ -327,6 +336,46 @@ find_matching_remote_for_project() {
   fi
 }
 
+find_matching_remote_for_branch() {
+  branch_name=$1
+  configured_remote=$(git config --get "branch.$branch_name.remote" 2>/dev/null || true)
+  fallback_remote=""
+  multiple_matches="false"
+  matched_remote=""
+
+  if [ -n "$configured_remote" ] && [ "$configured_remote" != "." ]; then
+    if git ls-remote --exit-code --heads "$configured_remote" "$branch_name" >/dev/null 2>&1; then
+      matched_remote=$configured_remote
+      return
+    fi
+  fi
+
+  for remote_name in $(git remote); do
+    if git ls-remote --exit-code --heads "$remote_name" "$branch_name" >/dev/null 2>&1; then
+      if [ "$remote_name" = "origin" ]; then
+        matched_remote=$remote_name
+        return
+      fi
+      if [ -z "$fallback_remote" ]; then
+        fallback_remote=$remote_name
+      else
+        multiple_matches="true"
+      fi
+    fi
+  done
+
+  if [ -n "$fallback_remote" ] && [ "$multiple_matches" != "true" ]; then
+    matched_remote=$fallback_remote
+    return
+  fi
+
+  if [ -n "$fallback_remote" ] && [ "$multiple_matches" = "true" ]; then
+    fail "branch '$branch_name' exists on multiple remotes. Configure its upstream remote locally or use a merge request URL instead."
+  fi
+
+  fail "no remote branch named '$branch_name' was found. Push the branch first or use a merge request URL."
+}
+
 fetch_exact_remote_branch() {
   remote_name=$1
   branch_name=$2
@@ -345,7 +394,7 @@ fetch_exact_remote_branch() {
 
 ensure_clean_worktree_for_switch() {
   if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
-    fail "working tree has uncommitted changes. Commit or stash them before switching branches for a merge request review."
+    fail "working tree has uncommitted changes. Commit or stash them before reviewing another branch or merge request."
   fi
 }
 
@@ -354,28 +403,44 @@ switch_to_exact_branch() {
   target_sha=$2
   target_track_ref=$3
 
+  ensure_clean_worktree_for_switch
+
   current_branch=$(git rev-parse --abbrev-ref HEAD)
   current_sha=$(git rev-parse HEAD)
-
-  if [ "$current_branch" = "$target_branch" ]; then
-    if [ "$current_sha" != "$target_sha" ]; then
-      fail "current branch '$target_branch' does not match merge request branch exactly (local $current_sha, expected $target_sha). Update the branch and rerun."
-    fi
-    return
-  fi
-
-  ensure_clean_worktree_for_switch
 
   if git show-ref --verify --quiet "refs/heads/$target_branch"; then
     local_branch_sha=$(git rev-parse "refs/heads/$target_branch")
 
     if [ "$local_branch_sha" != "$target_sha" ]; then
-      fail "local branch '$target_branch' does not match merge request branch exactly (local $local_branch_sha, expected $target_sha). Update or delete the local branch and rerun."
+      if ! git merge-base --is-ancestor "$local_branch_sha" "$target_sha" >/dev/null 2>&1; then
+        if [ -n "$target_track_ref" ]; then
+          fail "local branch '$target_branch' is not fast-forwardable to remote branch '$target_track_ref' (local $local_branch_sha, remote $target_sha). Update or delete the local branch and rerun."
+        fi
+        fail "local branch '$target_branch' is not fast-forwardable to the fetched branch commit (local $local_branch_sha, expected $target_sha). Update or delete the local branch and rerun."
+      fi
+
+      if [ "$current_branch" = "$target_branch" ]; then
+        if [ -n "$target_track_ref" ]; then
+          if ! git merge --ff-only --quiet "$target_track_ref"; then
+            fail "failed to fast-forward branch '$target_branch' to remote branch '$target_track_ref'."
+          fi
+        else
+          if ! git merge --ff-only --quiet "$target_sha"; then
+            fail "failed to fast-forward branch '$target_branch' to commit '$target_sha'."
+          fi
+        fi
+      else
+        if ! git update-ref "refs/heads/$target_branch" "$target_sha" "$local_branch_sha"; then
+          fail "failed to fast-forward local branch '$target_branch' to '$target_sha'."
+        fi
+      fi
     fi
 
-    if ! git switch --quiet "$target_branch" 2>/dev/null; then
-      if ! git checkout --quiet "$target_branch"; then
-        fail "failed to switch to local branch '$target_branch'."
+    if [ "$current_branch" != "$target_branch" ]; then
+      if ! git switch --quiet "$target_branch" 2>/dev/null; then
+        if ! git checkout --quiet "$target_branch"; then
+          fail "failed to switch to local branch '$target_branch'."
+        fi
       fi
     fi
   else
@@ -398,11 +463,11 @@ switch_to_exact_branch() {
   current_sha=$(git rev-parse HEAD)
 
   if [ "$current_branch" != "$target_branch" ]; then
-    fail "failed to switch to merge request branch '$target_branch'."
+    fail "failed to switch to branch '$target_branch'."
   fi
 
   if [ "$current_sha" != "$target_sha" ]; then
-    fail "switched to '$target_branch' but it does not match the merge request commit exactly (local $current_sha, expected $target_sha)."
+    fail "switched to '$target_branch' but it does not match the fetched remote branch exactly (local $current_sha, expected $target_sha)."
   fi
 }
 
@@ -521,8 +586,12 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     *)
-      if [ -z "$requested_mr_url" ] && is_merge_request_url "$1"; then
-        requested_mr_url=$1
+      if [ -z "$requested_mr_url" ] && [ -z "$requested_review_branch" ]; then
+        if is_merge_request_url "$1"; then
+          requested_mr_url=$1
+        else
+          requested_review_branch=$1
+        fi
       else
         usage >&2
         exit 1
@@ -554,6 +623,12 @@ fi
 
 if [ "$need_gitlab_api" = "true" ]; then
   ensure_gitlab_prerequisites
+fi
+
+if [ -n "$requested_review_branch" ]; then
+  find_matching_remote_for_branch "$requested_review_branch"
+  fetch_exact_remote_branch "$matched_remote" "$requested_review_branch"
+  switch_to_exact_branch "$requested_review_branch" "$fetched_branch_sha" "$fetched_branch_track_ref"
 fi
 
 if [ -n "$requested_mr_url" ]; then

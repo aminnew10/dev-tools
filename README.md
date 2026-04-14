@@ -29,7 +29,7 @@ GitLab-backed features need `curl`, `jq`, and either `GITLAB_TOKEN` or
 
 | Option | What it does |
 | --- | --- |
-| `<merge-request-url>` | Reviews a specific GitLab merge request by fetching its source branch, switching to that exact branch state, and using that MR as the review target. |
+| `<branch-name-or-merge-request-url>` | Reviews a specific remote branch or GitLab merge request by fetching it, switching to that branch safely, and ensuring the checked-out branch matches the remote exactly. |
 | `--open` | Opens GitHub Copilot with the generated review prompt. This is the default behavior. |
 | `--prompt` | Prints the generated prompt instead of opening Copilot. |
 | `--base <ref>` | Uses another branch, commit hash, or GitLab merge request URL as the review base. |
@@ -52,6 +52,12 @@ Review the current branch against another branch for a stacked merge request:
 review --base feature/parent
 ```
 
+Fetch a remote branch, switch to it, and review it against `main`:
+
+```sh
+review feature/child
+```
+
 Fetch a merge request branch, switch to its exact source branch state, and start a review:
 
 ```sh
@@ -64,8 +70,10 @@ Include unresolved GitLab Duo comments and ask Copilot to comment substantive fi
 review --duo --comment
 ```
 
-If `review` needs to switch branches for a merge request review, keep your
-tracked working tree clean first so the switch can happen safely.
+If `review` needs to switch branches for a branch or merge request review, keep
+your tracked working tree clean first so the switch can happen safely. Existing
+local branches are only reused when they already match the fetched remote
+branch or can be fast-forwarded to it.
 
 ## License
 
