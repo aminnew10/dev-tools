@@ -1,0 +1,408 @@
+#!/bin/sh
+set -eu
+
+default_base="main"
+requested_base="$default_base"
+mode="open"
+include_duo="false"
+resolve_duo="false"
+comment_on_mr="false"
+explicit_base="false"
+need_gitlab_context="false"
+
+usage() {
+  cat <<EOF
+Usage:
+  review [--open | --prompt] [--base <branch-or-commit>] [--duo [--resolve]] [--comment]
+  review --help
+
+Generate a Copilot review prompt for the current branch. By default, this opens
+Copilot with the generated prompt.
+
+Options:
+  --open                 Open Copilot with the generated prompt (default)
+  --prompt               Print the generated prompt instead of opening Copilot
+  --base <ref>           Compare against the given base branch or commit hash.
+                         Useful for stacked merge requests. Default: $default_base
+  --duo                  Find the open GitLab merge request for the current branch
+                         and append GitLab Duo comments to the prompt
+  --resolve              With --duo, ask Copilot to reply to and resolve Duo
+                         comments that are incorrect, irrelevant, or too nitpicky
+  --comment              Ask Copilot to post substantive review findings back to
+                         the open GitLab merge request as inline comments
+  -h, --help             Show this help text
+
+Notes:
+  --resolve requires --duo.
+  GitLab features (--duo, --comment, --resolve) require curl, jq, and
+  GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
+  GitLab features require a checked-out branch with exactly one open GitLab
+  merge request.
+
+Examples:
+  review
+  review --prompt
+  review --base feature/parent --prompt
+  review --duo
+  review --duo --resolve
+  review --comment
+  review --duo --comment --resolve
+EOF
+}
+
+fail() {
+  echo "review: $1" >&2
+  exit 1
+}
+
+append_prompt() {
+  prompt=$(printf '%s\n\n%s' "$prompt" "$1")
+}
+
+require_command_with_help() {
+  command_name=$1
+  install_hint=$2
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    if [ -n "$install_hint" ]; then
+      fail "required command not found: $command_name. $install_hint"
+    fi
+    fail "required command not found: $command_name"
+  fi
+}
+
+parse_gitlab_remote() {
+  remote_url=$1
+
+  if [ -z "$remote_url" ]; then
+    fail "could not determine the Git remote URL. Set the branch remote or rerun without GitLab options."
+  fi
+
+  case "$remote_url" in
+    git@*:*)
+      gitlab_scheme="https"
+      gitlab_host=${remote_url#git@}
+      gitlab_host=${gitlab_host%%:*}
+      gitlab_project_path=${remote_url#*:}
+      ;;
+    ssh://git@*/*)
+      gitlab_scheme="https"
+      remote_rest=${remote_url#ssh://git@}
+      gitlab_host=${remote_rest%%/*}
+      gitlab_project_path=${remote_rest#*/}
+      ;;
+    http://*/*)
+      gitlab_scheme="http"
+      remote_rest=${remote_url#http://}
+      gitlab_host=${remote_rest%%/*}
+      gitlab_project_path=${remote_rest#*/}
+      ;;
+    https://*/*)
+      gitlab_scheme="https"
+      remote_rest=${remote_url#https://}
+      gitlab_host=${remote_rest%%/*}
+      gitlab_project_path=${remote_rest#*/}
+      ;;
+    *)
+      fail "unsupported remote URL for GitLab options: $remote_url. Use a GitLab SSH or HTTPS remote."
+      ;;
+  esac
+
+  gitlab_project_path=${gitlab_project_path%.git}
+
+  if [ -z "$gitlab_host" ] || [ -z "$gitlab_project_path" ]; then
+    fail "failed to parse the GitLab project from remote URL: $remote_url"
+  fi
+}
+
+urlencode() {
+  printf '%s' "$1" | jq -sRr @uri
+}
+
+gitlab_get() {
+  endpoint=$1
+  curl --silent --show-error --fail \
+    --header "PRIVATE-TOKEN: $gitlab_token" \
+    "$gitlab_api_base/$endpoint"
+}
+
+resolve_base_ref() {
+  candidate=$1
+
+  if [ -z "$candidate" ]; then
+    fail "--base requires a branch name or commit hash"
+  fi
+
+  if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+    base_ref="origin/$candidate"
+  elif git show-ref --verify --quiet "refs/heads/$candidate"; then
+    base_ref="$candidate"
+  elif git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null 2>&1; then
+    base_ref="$candidate"
+  else
+    fail "could not resolve base reference '$candidate'"
+  fi
+}
+
+ensure_gitlab_prerequisites() {
+  require_command_with_help curl "Install it with Homebrew: brew install curl"
+  require_command_with_help jq "Install it with Homebrew: brew install jq"
+
+  gitlab_token=${GITLAB_TOKEN-}
+  if [ -z "$gitlab_token" ]; then
+    gitlab_token=${GITLAB_ACCESS_TOKEN-}
+  fi
+
+  if [ -z "$gitlab_token" ]; then
+    cat >&2 <<EOF
+review: GitLab options require GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
+
+Fix it by exporting one of them before running review, for example:
+  export GITLAB_TOKEN=<your-gitlab-token>
+
+Then rerun the command.
+EOF
+    exit 1
+  fi
+}
+
+load_merge_request_context() {
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$current_branch" = "HEAD" ]; then
+    fail "GitLab options require a checked-out branch. Run 'git switch <branch>' and rerun."
+  fi
+
+  branch_remote=$(git config --get "branch.$current_branch.remote" 2>/dev/null || true)
+  if [ -z "$branch_remote" ] || [ "$branch_remote" = "." ]; then
+    branch_remote="origin"
+  fi
+
+  remote_url=$(git config --get "remote.$branch_remote.url" 2>/dev/null || true)
+  parse_gitlab_remote "$remote_url"
+  gitlab_api_base="$gitlab_scheme://$gitlab_host/api/v4"
+
+  encoded_project_path=$(urlencode "$gitlab_project_path")
+  encoded_branch=$(urlencode "$current_branch")
+
+  if ! merge_requests_json=$(gitlab_get "projects/$encoded_project_path/merge_requests?state=opened&source_branch=$encoded_branch&per_page=2"); then
+    fail "failed to query open merge requests for branch '$current_branch'. Check that the remote points to GitLab and that your token has API access."
+  fi
+
+  merge_request_count=$(printf '%s' "$merge_requests_json" | jq 'length')
+  case "$merge_request_count" in
+    0)
+      fail "no open merge request found for branch '$current_branch' in '$gitlab_project_path'. Open the merge request or rerun without GitLab options."
+      ;;
+    1)
+      ;;
+    *)
+      fail "multiple open merge requests found for branch '$current_branch' in '$gitlab_project_path'. Close the extras or use a unique source branch."
+      ;;
+  esac
+
+  merge_request_iid=$(printf '%s' "$merge_requests_json" | jq -r '.[0].iid')
+
+  if ! merge_request_detail_json=$(gitlab_get "projects/$encoded_project_path/merge_requests/$merge_request_iid"); then
+    fail "failed to load merge request !${merge_request_iid}. Check that your token can read merge requests."
+  fi
+
+  merge_request_title=$(printf '%s' "$merge_request_detail_json" | jq -r '.title')
+  merge_request_url=$(printf '%s' "$merge_request_detail_json" | jq -r '.web_url')
+  mr_base_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.base_sha')
+  mr_start_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.start_sha')
+  mr_head_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.head_sha')
+
+  if [ "$mr_base_sha" = "null" ] || [ "$mr_start_sha" = "null" ] || [ "$mr_head_sha" = "null" ]; then
+    fail "merge request !${merge_request_iid} is missing diff refs. Wait for GitLab to prepare the diff and rerun."
+  fi
+
+  mr_discussions_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
+  mr_notes_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --open)
+      mode="open"
+      ;;
+    --prompt)
+      mode="prompt"
+      ;;
+    --duo)
+      include_duo="true"
+      ;;
+    --resolve)
+      resolve_duo="true"
+      ;;
+    --comment)
+      comment_on_mr="true"
+      ;;
+    --base)
+      shift
+      if [ "$#" -eq 0 ]; then
+        fail "--base requires a branch name or commit hash"
+      fi
+      requested_base=$1
+      explicit_base="true"
+      ;;
+    --base=*)
+      requested_base=${1#--base=}
+      explicit_base="true"
+      if [ -z "$requested_base" ]; then
+        fail "--base requires a branch name or commit hash"
+      fi
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [ "$resolve_duo" = "true" ] && [ "$include_duo" != "true" ]; then
+  fail "--resolve requires --duo"
+fi
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  fail "not inside a Git repository"
+fi
+
+if [ "$include_duo" = "true" ] || [ "$comment_on_mr" = "true" ]; then
+  need_gitlab_context="true"
+fi
+
+resolve_base_ref "$requested_base"
+
+if [ "$explicit_base" = "true" ]; then
+  if [ "$base_ref" = "$requested_base" ]; then
+    base_description=$(printf "base reference '%s'" "$requested_base")
+  else
+    base_description=$(printf "requested base reference '%s' (resolved locally as '%s')" "$requested_base" "$base_ref")
+  fi
+else
+  if [ "$base_ref" = "$default_base" ]; then
+    base_description=$(printf "base branch '%s'" "$default_base")
+  else
+    base_description=$(printf "base branch '%s' (resolved locally as '%s')" "$default_base" "$base_ref")
+  fi
+fi
+
+if ! merge_base=$(git merge-base HEAD "$base_ref"); then
+  fail "failed to determine merge base against '$base_ref'"
+fi
+
+prompt=$(printf "Review the code changes against the %s. The merge base commit for this comparison is %s. Run \`git diff %s\` to inspect the changes included since that merge base. Provide prioritized, actionable findings." \
+  "$base_description" \
+  "$merge_base" \
+  "$merge_base")
+
+if [ "$need_gitlab_context" = "true" ]; then
+  ensure_gitlab_prerequisites
+  load_merge_request_context
+
+  mr_context=$(printf "There is an open GitLab merge request for this branch: %s (project %s, IID !%s, title: %s)." \
+    "$merge_request_url" \
+    "$gitlab_project_path" \
+    "$merge_request_iid" \
+    "$merge_request_title")
+  append_prompt "$mr_context"
+fi
+
+if [ "$include_duo" = "true" ]; then
+  if ! discussions_json=$(gitlab_get "projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions?per_page=100"); then
+    fail "failed to load merge request discussions for !${merge_request_iid}. Check that your token can read discussions."
+  fi
+
+  duo_comments=$(printf '%s' "$discussions_json" | jq -r '
+    [
+      .[]
+      | .id as $discussion_id
+      | .notes[]
+      | select(.author.username == "GitLabDuo" and .resolvable == true and (.resolved // false) == false)
+      | {
+          discussion_id: $discussion_id,
+          note_id: (.id | tostring),
+          status: (
+            if .resolvable == true then
+              if .resolved == true then "resolved" else "unresolved" end
+            else
+              "non-resolvable"
+            end
+          ),
+          location: (
+            if .position == null then
+              "general"
+            else
+              (.position.new_path // .position.old_path // "unknown")
+              + (
+                  if (.position.new_line // .position.old_line) != null then
+                    ":" + ((.position.new_line // .position.old_line) | tostring)
+                  else
+                    ""
+                  end
+                )
+            end
+          ),
+          body: .body
+        }
+    ]
+    | if length == 0 then
+        "No unresolved GitLab Duo comments were found on the open merge request."
+      else
+        map(
+          "- discussion " + .discussion_id
+          + ", note " + .note_id
+          + ", " + .status
+          + ", location: " + .location
+          + "\n" + .body
+        )
+        | join("\n\n")
+      end
+  ')
+
+  duo_context=$(printf "GitLab Duo comments can be useful hints, but validate them against the actual code and behavior because some may be incorrect, irrelevant, or overly nitpicky. Only unresolved GitLab Duo comments are included below; resolved comments are intentionally ignored.\n\nEach entry below includes the GitLab discussion ID, note ID, status, and location.\n\nGitLab Duo comments:\n%s" \
+    "$duo_comments")
+  append_prompt "$duo_context"
+
+  if [ "$resolve_duo" = "true" ]; then
+    unresolved_duo_comments=$(printf '%s' "$discussions_json" | jq '
+      [
+        .[]
+        | .notes[]
+        | select(.author.username == "GitLabDuo" and .resolvable == true and (.resolved // false) == false)
+      ]
+      | length
+    ')
+
+    if [ "$unresolved_duo_comments" -gt 0 ]; then
+      resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\nGitLab API for Duo replies:\n- Reply: POST %s/<discussion_id>/notes with form field body=<reply>\n- Resolve: PUT %s/<discussion_id>?resolved=true" \
+        "$mr_discussions_endpoint" \
+        "$mr_discussions_endpoint")
+      append_prompt "$resolve_context"
+    else
+      append_prompt "There are no unresolved GitLab Duo discussions to reply to or resolve."
+    fi
+  fi
+fi
+
+if [ "$comment_on_mr" = "true" ]; then
+  comment_context=$(printf "Post substantive review findings directly to the open GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: \$GITLAB_TOKEN (or \$GITLAB_ACCESS_TOKEN)\n- Form fields for added or changed lines:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[new_path]=<file path>\n  position[new_line]=<line number>\n- For removed lines, use old_path and old_line instead.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
+    "$mr_discussions_endpoint" \
+    "$mr_base_sha" \
+    "$mr_start_sha" \
+    "$mr_head_sha" \
+    "$mr_notes_endpoint")
+  append_prompt "$comment_context"
+fi
+
+if [ "$mode" = "open" ]; then
+  require_command_with_help copilot "Install GitHub Copilot CLI or rerun with --prompt."
+  exec copilot -i "$prompt"
+fi
+
+printf "%s\n" "$prompt"
