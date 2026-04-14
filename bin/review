@@ -3,17 +3,21 @@ set -eu
 
 default_base="main"
 requested_base="$default_base"
+requested_mr_url=""
 mode="open"
 include_duo="false"
 resolve_duo="false"
 comment_on_mr="false"
 explicit_base="false"
-need_gitlab_context="false"
+requested_base_is_mr_url="false"
+need_gitlab_api="false"
+need_primary_mr_context="false"
+primary_mr_context_loaded="false"
 
 usage() {
   cat <<EOF
 Usage:
-  review [--open | --prompt] [--base <branch-or-commit>] [--duo [--resolve]] [--comment]
+  review [--open | --prompt] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<merge-request-url>]
   review --help
 
 Generate a Copilot review prompt for the current branch. By default, this opens
@@ -22,31 +26,39 @@ Copilot with the generated prompt.
 Options:
   --open                 Open Copilot with the generated prompt (default)
   --prompt               Print the generated prompt instead of opening Copilot
-  --base <ref>           Compare against the given base branch or commit hash.
-                         Useful for stacked merge requests. Default: $default_base
-  --duo                  Find the open GitLab merge request for the current branch
-                         and append GitLab Duo comments to the prompt
+  --base <ref>           Compare against the given base branch, commit hash, or
+                         GitLab merge request URL. Useful for stacked merge
+                         requests. Default: $default_base
+  --duo                  Find unresolved GitLab Duo comments for the target merge
+                         request and append them to the prompt
   --resolve              With --duo, ask Copilot to reply to and resolve Duo
                          comments that are incorrect, irrelevant, or too nitpicky
   --comment              Ask Copilot to post substantive review findings back to
-                         the open GitLab merge request as inline comments
+                         the target GitLab merge request as inline comments
   -h, --help             Show this help text
+
+Arguments:
+  <merge-request-url>    Review the given GitLab merge request. The command will
+                         fetch the MR branch, switch to the exact source branch,
+                         and then start the review from that branch state
 
 Notes:
   --resolve requires --duo.
-  GitLab features (--duo, --comment, --resolve) require curl, jq, and
+  GitLab features (MR URLs, --duo, --comment, --resolve) require curl, jq, and
   GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
-  GitLab features require a checked-out branch with exactly one open GitLab
-  merge request.
+  MR URL review requires a configured git remote that matches the MR source
+  project, and a clean working tree if a branch switch is needed.
 
 Examples:
   review
   review --prompt
   review --base feature/parent --prompt
+  review --base https://gitlab.com/group/project/-/merge_requests/123 --prompt
+  review https://gitlab.com/group/project/-/merge_requests/124
   review --duo
   review --duo --resolve
   review --comment
-  review --duo --comment --resolve
+  review https://gitlab.com/group/project/-/merge_requests/124 --duo --comment
 EOF
 }
 
@@ -71,47 +83,117 @@ require_command_with_help() {
   fi
 }
 
-parse_gitlab_remote() {
+try_parse_gitlab_remote() {
   remote_url=$1
 
   if [ -z "$remote_url" ]; then
-    fail "could not determine the Git remote URL. Set the branch remote or rerun without GitLab options."
+    return 1
   fi
 
   case "$remote_url" in
     git@*:*)
-      gitlab_scheme="https"
-      gitlab_host=${remote_url#git@}
-      gitlab_host=${gitlab_host%%:*}
-      gitlab_project_path=${remote_url#*:}
+      parsed_gitlab_scheme="https"
+      parsed_gitlab_host=${remote_url#git@}
+      parsed_gitlab_host=${parsed_gitlab_host%%:*}
+      parsed_gitlab_project_path=${remote_url#*:}
       ;;
     ssh://git@*/*)
-      gitlab_scheme="https"
+      parsed_gitlab_scheme="https"
       remote_rest=${remote_url#ssh://git@}
-      gitlab_host=${remote_rest%%/*}
-      gitlab_project_path=${remote_rest#*/}
+      parsed_gitlab_host=${remote_rest%%/*}
+      parsed_gitlab_project_path=${remote_rest#*/}
       ;;
     http://*/*)
-      gitlab_scheme="http"
+      parsed_gitlab_scheme="http"
       remote_rest=${remote_url#http://}
-      gitlab_host=${remote_rest%%/*}
-      gitlab_project_path=${remote_rest#*/}
+      parsed_gitlab_host=${remote_rest%%/*}
+      parsed_gitlab_project_path=${remote_rest#*/}
       ;;
     https://*/*)
-      gitlab_scheme="https"
+      parsed_gitlab_scheme="https"
       remote_rest=${remote_url#https://}
-      gitlab_host=${remote_rest%%/*}
-      gitlab_project_path=${remote_rest#*/}
+      parsed_gitlab_host=${remote_rest%%/*}
+      parsed_gitlab_project_path=${remote_rest#*/}
       ;;
     *)
-      fail "unsupported remote URL for GitLab options: $remote_url. Use a GitLab SSH or HTTPS remote."
+      return 1
       ;;
   esac
 
-  gitlab_project_path=${gitlab_project_path%.git}
+  parsed_gitlab_project_path=${parsed_gitlab_project_path%.git}
 
-  if [ -z "$gitlab_host" ] || [ -z "$gitlab_project_path" ]; then
-    fail "failed to parse the GitLab project from remote URL: $remote_url"
+  if [ -z "$parsed_gitlab_host" ] || [ -z "$parsed_gitlab_project_path" ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+parse_gitlab_remote() {
+  remote_url=$1
+
+  if ! try_parse_gitlab_remote "$remote_url"; then
+    if [ -z "$remote_url" ]; then
+      fail "could not determine the Git remote URL. Set the branch remote or rerun without GitLab options."
+    fi
+    fail "unsupported remote URL for GitLab options: $remote_url. Use a GitLab SSH or HTTPS remote."
+  fi
+
+  gitlab_scheme=$parsed_gitlab_scheme
+  gitlab_host=$parsed_gitlab_host
+  gitlab_project_path=$parsed_gitlab_project_path
+}
+
+try_parse_merge_request_url() {
+  mr_url=$1
+
+  case "$mr_url" in
+    http://*/*/-/merge_requests/*|https://*/*/-/merge_requests/*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  parsed_mr_scheme=${mr_url%%://*}
+  mr_url_without_scheme=${mr_url#*://}
+  parsed_mr_host=${mr_url_without_scheme%%/*}
+  mr_url_path=${mr_url_without_scheme#*/}
+
+  case "$mr_url_path" in
+    */-/merge_requests/*)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  parsed_mr_project_path=${mr_url_path%%/-/merge_requests/*}
+  parsed_mr_iid_part=${mr_url_path#"$parsed_mr_project_path"/-/merge_requests/}
+  parsed_mr_iid=${parsed_mr_iid_part%%[/?#]*}
+
+  case "$parsed_mr_iid" in
+    ""|*[!0-9]*)
+      return 1
+      ;;
+  esac
+
+  if [ -z "$parsed_mr_host" ] || [ -z "$parsed_mr_project_path" ]; then
+    return 1
+  fi
+
+  return 0
+}
+
+is_merge_request_url() {
+  try_parse_merge_request_url "$1"
+}
+
+parse_merge_request_url() {
+  mr_url=$1
+
+  if ! try_parse_merge_request_url "$mr_url"; then
+    fail "invalid merge request URL: $mr_url"
   fi
 }
 
@@ -119,18 +201,24 @@ urlencode() {
   printf '%s' "$1" | jq -sRr @uri
 }
 
-gitlab_get() {
-  endpoint=$1
+gitlab_get_with_base() {
+  api_base=$1
+  endpoint=$2
+
   curl --silent --show-error --fail \
     --header "PRIVATE-TOKEN: $gitlab_token" \
-    "$gitlab_api_base/$endpoint"
+    "$api_base/$endpoint"
+}
+
+gitlab_get() {
+  gitlab_get_with_base "$gitlab_api_base" "$1"
 }
 
 resolve_base_ref() {
   candidate=$1
 
   if [ -z "$candidate" ]; then
-    fail "--base requires a branch name or commit hash"
+    fail "--base requires a branch name, commit hash, or merge request URL"
   fi
 
   if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
@@ -166,10 +254,186 @@ EOF
   fi
 }
 
-load_merge_request_context() {
+load_merge_request_from_url() {
+  mr_url=$1
+
+  parse_merge_request_url "$mr_url"
+
+  loaded_mr_scheme=$parsed_mr_scheme
+  loaded_mr_host=$parsed_mr_host
+  loaded_mr_project_path=$parsed_mr_project_path
+  loaded_mr_iid=$parsed_mr_iid
+  loaded_mr_encoded_project_path=$(urlencode "$loaded_mr_project_path")
+  loaded_mr_api_base="$loaded_mr_scheme://$loaded_mr_host/api/v4"
+
+  if ! loaded_mr_json=$(gitlab_get_with_base "$loaded_mr_api_base" "projects/$loaded_mr_encoded_project_path/merge_requests/$loaded_mr_iid"); then
+    fail "failed to load merge request from URL: $mr_url. Check that the URL is correct and that your token can read it."
+  fi
+
+  loaded_mr_title=$(printf '%s' "$loaded_mr_json" | jq -r '.title')
+  loaded_mr_web_url=$(printf '%s' "$loaded_mr_json" | jq -r '.web_url')
+  loaded_mr_source_branch=$(printf '%s' "$loaded_mr_json" | jq -r '.source_branch')
+  loaded_mr_base_sha=$(printf '%s' "$loaded_mr_json" | jq -r '.diff_refs.base_sha')
+  loaded_mr_start_sha=$(printf '%s' "$loaded_mr_json" | jq -r '.diff_refs.start_sha')
+  loaded_mr_head_sha=$(printf '%s' "$loaded_mr_json" | jq -r '.diff_refs.head_sha')
+  loaded_mr_project_id=$(printf '%s' "$loaded_mr_json" | jq -r '.project_id')
+  loaded_mr_source_project_id=$(printf '%s' "$loaded_mr_json" | jq -r '.source_project_id')
+
+  if [ -z "$loaded_mr_source_branch" ] || [ "$loaded_mr_source_branch" = "null" ]; then
+    fail "merge request URL '$mr_url' does not expose a source branch."
+  fi
+
+  if [ "$loaded_mr_source_project_id" = "null" ] || [ -z "$loaded_mr_source_project_id" ] || [ "$loaded_mr_source_project_id" = "$loaded_mr_project_id" ]; then
+    loaded_mr_source_project_path=$loaded_mr_project_path
+  else
+    if ! source_project_json=$(gitlab_get_with_base "$loaded_mr_api_base" "projects/$loaded_mr_source_project_id"); then
+      fail "failed to load the source project for merge request '$mr_url'."
+    fi
+
+    loaded_mr_source_project_path=$(printf '%s' "$source_project_json" | jq -r '.path_with_namespace')
+
+    if [ -z "$loaded_mr_source_project_path" ] || [ "$loaded_mr_source_project_path" = "null" ]; then
+      fail "failed to determine the source project path for merge request '$mr_url'."
+    fi
+  fi
+}
+
+find_matching_remote_for_project() {
+  desired_host=$1
+  desired_project_path=$2
+  matched_remote=""
+  fallback_remote=""
+
+  for remote_name in $(git remote); do
+    remote_url=$(git config --get "remote.$remote_name.url" 2>/dev/null || true)
+    if try_parse_gitlab_remote "$remote_url"; then
+      if [ "$parsed_gitlab_host" = "$desired_host" ] && [ "$parsed_gitlab_project_path" = "$desired_project_path" ]; then
+        if [ "$remote_name" = "origin" ]; then
+          matched_remote=$remote_name
+          break
+        fi
+        if [ -z "$fallback_remote" ]; then
+          fallback_remote=$remote_name
+        fi
+      fi
+    fi
+  done
+
+  if [ -z "$matched_remote" ]; then
+    matched_remote=$fallback_remote
+  fi
+
+  if [ -z "$matched_remote" ]; then
+    fail "no configured git remote matches GitLab project '$desired_project_path' on '$desired_host'. Add a matching remote and rerun."
+  fi
+}
+
+fetch_exact_remote_branch() {
+  remote_name=$1
+  branch_name=$2
+
+  if ! git fetch --quiet "$remote_name" "$branch_name"; then
+    fail "failed to fetch branch '$branch_name' from remote '$remote_name'."
+  fi
+
+  fetched_branch_sha=$(git rev-parse FETCH_HEAD)
+  fetched_branch_track_ref=""
+
+  if git show-ref --verify --quiet "refs/remotes/$remote_name/$branch_name"; then
+    fetched_branch_track_ref="$remote_name/$branch_name"
+  fi
+}
+
+ensure_clean_worktree_for_switch() {
+  if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    fail "working tree has uncommitted changes. Commit or stash them before switching branches for a merge request review."
+  fi
+}
+
+switch_to_exact_branch() {
+  target_branch=$1
+  target_sha=$2
+  target_track_ref=$3
+
   current_branch=$(git rev-parse --abbrev-ref HEAD)
+  current_sha=$(git rev-parse HEAD)
+
+  if [ "$current_branch" = "$target_branch" ]; then
+    if [ "$current_sha" != "$target_sha" ]; then
+      fail "current branch '$target_branch' does not match merge request branch exactly (local $current_sha, expected $target_sha). Update the branch and rerun."
+    fi
+    return
+  fi
+
+  ensure_clean_worktree_for_switch
+
+  if git show-ref --verify --quiet "refs/heads/$target_branch"; then
+    local_branch_sha=$(git rev-parse "refs/heads/$target_branch")
+
+    if [ "$local_branch_sha" != "$target_sha" ]; then
+      fail "local branch '$target_branch' does not match merge request branch exactly (local $local_branch_sha, expected $target_sha). Update or delete the local branch and rerun."
+    fi
+
+    if ! git switch --quiet "$target_branch" 2>/dev/null; then
+      if ! git checkout --quiet "$target_branch"; then
+        fail "failed to switch to local branch '$target_branch'."
+      fi
+    fi
+  else
+    if [ -n "$target_track_ref" ]; then
+      if ! git switch --quiet -c "$target_branch" --track "$target_track_ref" 2>/dev/null; then
+        if ! git checkout --quiet -b "$target_branch" --track "$target_track_ref"; then
+          fail "failed to create branch '$target_branch' from '$target_track_ref'."
+        fi
+      fi
+    else
+      if ! git switch --quiet -c "$target_branch" "$target_sha" 2>/dev/null; then
+        if ! git checkout --quiet -b "$target_branch" "$target_sha"; then
+          fail "failed to create branch '$target_branch' from commit '$target_sha'."
+        fi
+      fi
+    fi
+  fi
+
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+  current_sha=$(git rev-parse HEAD)
+
+  if [ "$current_branch" != "$target_branch" ]; then
+    fail "failed to switch to merge request branch '$target_branch'."
+  fi
+
+  if [ "$current_sha" != "$target_sha" ]; then
+    fail "switched to '$target_branch' but it does not match the merge request commit exactly (local $current_sha, expected $target_sha)."
+  fi
+}
+
+set_primary_merge_request_context_from_loaded() {
+  primary_mr_context_loaded="true"
+  merge_request_iid=$loaded_mr_iid
+  merge_request_title=$loaded_mr_title
+  merge_request_url=$loaded_mr_web_url
+  merge_request_source_branch=$loaded_mr_source_branch
+  gitlab_host=$loaded_mr_host
+  gitlab_project_path=$loaded_mr_project_path
+  encoded_project_path=$loaded_mr_encoded_project_path
+  gitlab_api_base=$loaded_mr_api_base
+  mr_base_sha=$loaded_mr_base_sha
+  mr_start_sha=$loaded_mr_start_sha
+  mr_head_sha=$loaded_mr_head_sha
+
+  if [ "$mr_base_sha" = "null" ] || [ "$mr_start_sha" = "null" ] || [ "$mr_head_sha" = "null" ]; then
+    fail "merge request !${merge_request_iid} is missing diff refs. Wait for GitLab to prepare the diff and rerun."
+  fi
+
+  mr_discussions_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
+  mr_notes_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
+}
+
+load_primary_merge_request_for_current_branch() {
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+
   if [ "$current_branch" = "HEAD" ]; then
-    fail "GitLab options require a checked-out branch. Run 'git switch <branch>' and rerun."
+    fail "GitLab review features require a checked-out branch. Run 'git switch <branch>' and rerun."
   fi
 
   branch_remote=$(git config --get "branch.$current_branch.remote" 2>/dev/null || true)
@@ -180,7 +444,6 @@ load_merge_request_context() {
   remote_url=$(git config --get "remote.$branch_remote.url" 2>/dev/null || true)
   parse_gitlab_remote "$remote_url"
   gitlab_api_base="$gitlab_scheme://$gitlab_host/api/v4"
-
   encoded_project_path=$(urlencode "$gitlab_project_path")
   encoded_branch=$(urlencode "$current_branch")
 
@@ -191,7 +454,7 @@ load_merge_request_context() {
   merge_request_count=$(printf '%s' "$merge_requests_json" | jq 'length')
   case "$merge_request_count" in
     0)
-      fail "no open merge request found for branch '$current_branch' in '$gitlab_project_path'. Open the merge request or rerun without GitLab options."
+      fail "no open merge request found for branch '$current_branch' in '$gitlab_project_path'. Open the merge request or rerun without GitLab review options."
       ;;
     1)
       ;;
@@ -208,6 +471,7 @@ load_merge_request_context() {
 
   merge_request_title=$(printf '%s' "$merge_request_detail_json" | jq -r '.title')
   merge_request_url=$(printf '%s' "$merge_request_detail_json" | jq -r '.web_url')
+  merge_request_source_branch=$(printf '%s' "$merge_request_detail_json" | jq -r '.source_branch')
   mr_base_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.base_sha')
   mr_start_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.start_sha')
   mr_head_sha=$(printf '%s' "$merge_request_detail_json" | jq -r '.diff_refs.head_sha')
@@ -218,6 +482,7 @@ load_merge_request_context() {
 
   mr_discussions_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
   mr_notes_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
+  primary_mr_context_loaded="true"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -240,7 +505,7 @@ while [ "$#" -gt 0 ]; do
     --base)
       shift
       if [ "$#" -eq 0 ]; then
-        fail "--base requires a branch name or commit hash"
+        fail "--base requires a branch name, commit hash, or merge request URL"
       fi
       requested_base=$1
       explicit_base="true"
@@ -249,7 +514,7 @@ while [ "$#" -gt 0 ]; do
       requested_base=${1#--base=}
       explicit_base="true"
       if [ -z "$requested_base" ]; then
-        fail "--base requires a branch name or commit hash"
+        fail "--base requires a branch name, commit hash, or merge request URL"
       fi
       ;;
     --help|-h)
@@ -257,8 +522,12 @@ while [ "$#" -gt 0 ]; do
       exit 0
       ;;
     *)
-      usage >&2
-      exit 1
+      if [ -z "$requested_mr_url" ] && is_merge_request_url "$1"; then
+        requested_mr_url=$1
+      else
+        usage >&2
+        exit 1
+      fi
       ;;
   esac
   shift
@@ -272,24 +541,56 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fail "not inside a Git repository"
 fi
 
-if [ "$include_duo" = "true" ] || [ "$comment_on_mr" = "true" ]; then
-  need_gitlab_context="true"
+if is_merge_request_url "$requested_base"; then
+  requested_base_is_mr_url="true"
 fi
 
-resolve_base_ref "$requested_base"
+if [ -n "$requested_mr_url" ] || [ "$include_duo" = "true" ] || [ "$comment_on_mr" = "true" ]; then
+  need_primary_mr_context="true"
+fi
 
-if [ "$explicit_base" = "true" ]; then
-  if [ "$base_ref" = "$requested_base" ]; then
-    base_description=$(printf "base reference '%s'" "$requested_base")
-  else
-    base_description=$(printf "requested base reference '%s' (resolved locally as '%s')" "$requested_base" "$base_ref")
-  fi
+if [ "$need_primary_mr_context" = "true" ] || [ "$requested_base_is_mr_url" = "true" ]; then
+  need_gitlab_api="true"
+fi
+
+if [ "$need_gitlab_api" = "true" ]; then
+  ensure_gitlab_prerequisites
+fi
+
+if [ -n "$requested_mr_url" ]; then
+  load_merge_request_from_url "$requested_mr_url"
+  find_matching_remote_for_project "$loaded_mr_host" "$loaded_mr_source_project_path"
+  fetch_exact_remote_branch "$matched_remote" "$loaded_mr_source_branch"
+  switch_to_exact_branch "$loaded_mr_source_branch" "$fetched_branch_sha" "$fetched_branch_track_ref"
+  set_primary_merge_request_context_from_loaded
+fi
+
+if [ "$requested_base_is_mr_url" = "true" ]; then
+  load_merge_request_from_url "$requested_base"
+  find_matching_remote_for_project "$loaded_mr_host" "$loaded_mr_source_project_path"
+  fetch_exact_remote_branch "$matched_remote" "$loaded_mr_source_branch"
+  base_ref=$fetched_branch_sha
+  base_description=$(printf "source branch '%s' from merge request '%s'" "$loaded_mr_source_branch" "$loaded_mr_web_url")
 else
-  if [ "$base_ref" = "$default_base" ]; then
-    base_description=$(printf "base branch '%s'" "$default_base")
+  resolve_base_ref "$requested_base"
+
+  if [ "$explicit_base" = "true" ]; then
+    if [ "$base_ref" = "$requested_base" ]; then
+      base_description=$(printf "base reference '%s'" "$requested_base")
+    else
+      base_description=$(printf "requested base reference '%s' (resolved locally as '%s')" "$requested_base" "$base_ref")
+    fi
   else
-    base_description=$(printf "base branch '%s' (resolved locally as '%s')" "$default_base" "$base_ref")
+    if [ "$base_ref" = "$default_base" ]; then
+      base_description=$(printf "base branch '%s'" "$default_base")
+    else
+      base_description=$(printf "base branch '%s' (resolved locally as '%s')" "$default_base" "$base_ref")
+    fi
   fi
+fi
+
+if [ "$need_primary_mr_context" = "true" ] && [ "$primary_mr_context_loaded" != "true" ]; then
+  load_primary_merge_request_for_current_branch
 fi
 
 if ! merge_base=$(git merge-base HEAD "$base_ref"); then
@@ -301,15 +602,13 @@ prompt=$(printf "Review the code changes against the %s. The merge base commit f
   "$merge_base" \
   "$merge_base")
 
-if [ "$need_gitlab_context" = "true" ]; then
-  ensure_gitlab_prerequisites
-  load_merge_request_context
-
-  mr_context=$(printf "There is an open GitLab merge request for this branch: %s (project %s, IID !%s, title: %s)." \
+if [ "$primary_mr_context_loaded" = "true" ]; then
+  mr_context=$(printf "This review targets the GitLab merge request %s (project %s, IID !%s, title: %s, source branch: %s)." \
     "$merge_request_url" \
     "$gitlab_project_path" \
     "$merge_request_iid" \
-    "$merge_request_title")
+    "$merge_request_title" \
+    "$merge_request_source_branch")
   append_prompt "$mr_context"
 fi
 
@@ -327,13 +626,7 @@ if [ "$include_duo" = "true" ]; then
       | {
           discussion_id: $discussion_id,
           note_id: (.id | tostring),
-          status: (
-            if .resolvable == true then
-              if .resolved == true then "resolved" else "unresolved" end
-            else
-              "non-resolvable"
-            end
-          ),
+          status: "unresolved",
           location: (
             if .position == null then
               "general"
@@ -352,7 +645,7 @@ if [ "$include_duo" = "true" ]; then
         }
     ]
     | if length == 0 then
-        "No unresolved GitLab Duo comments were found on the open merge request."
+        "No unresolved GitLab Duo comments were found on the target merge request."
       else
         map(
           "- discussion " + .discussion_id
@@ -391,7 +684,7 @@ if [ "$include_duo" = "true" ]; then
 fi
 
 if [ "$comment_on_mr" = "true" ]; then
-  comment_context=$(printf "Post substantive review findings directly to the open GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: \$GITLAB_TOKEN (or \$GITLAB_ACCESS_TOKEN)\n- Form fields for added or changed lines:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[new_path]=<file path>\n  position[new_line]=<line number>\n- For removed lines, use old_path and old_line instead.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
+  comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: \$GITLAB_TOKEN (or \$GITLAB_ACCESS_TOKEN)\n- Form fields for added or changed lines:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[new_path]=<file path>\n  position[new_line]=<line number>\n- For removed lines, use old_path and old_line instead.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
     "$mr_discussions_endpoint" \
     "$mr_base_sha" \
     "$mr_start_sha" \
