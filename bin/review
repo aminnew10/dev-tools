@@ -5,7 +5,7 @@ default_base="main"
 requested_base="$default_base"
 requested_mr_url=""
 requested_review_branch=""
-mode="prompt"
+mode="opencode"
 include_duo="false"
 resolve_duo="false"
 comment_on_mr="false"
@@ -14,27 +14,39 @@ requested_base_is_mr_url="false"
 need_gitlab_api="false"
 need_primary_mr_context="false"
 primary_mr_context_loaded="false"
+use_mcp="false"
 
 usage() {
   cat <<EOF
 Usage:
-  review [--copilot] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [<branch-name-or-merge-request-url>]
+  review [--opencode|--copilot|--claude|--print] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [--gitlab-mcp] [<branch-name-or-merge-request-url>]
   review --help
 
-Generate a Copilot review prompt for the current branch. By default, this prints
-the generated prompt. Use --copilot to pass it to GitHub Copilot CLI.
+Generate a code review prompt for the current branch and pass it to a local
+coding agent. By default the prompt is passed to opencode. All GitLab API
+calls made by this script go through the glab CLI. By default the agent is
+also instructed to use glab for any GitLab actions it performs; pass
+--gitlab-mcp to instruct the agent to use its installed GitLab MCP server
+instead.
 
 Options:
+  --opencode             Pass the generated prompt to opencode CLI (default)
   --copilot              Pass the generated prompt to GitHub Copilot CLI
+  --claude               Pass the generated prompt to Claude Code CLI
+  --print                Print the generated prompt instead of invoking an agent
   --base <ref>           Compare against the given base branch, commit hash, or
                          GitLab merge request URL. Useful for stacked merge
                          requests. Default: $default_base
   --duo                  Find unresolved GitLab Duo comments for the target merge
                          request and append them to the prompt
-  --resolve              With --duo, ask Copilot to reply to and resolve Duo
+  --resolve              With --duo, ask the agent to reply to and resolve Duo
                          comments that are incorrect, irrelevant, or too nitpicky
-  --comment              Ask Copilot to post substantive review findings back to
-                         the target GitLab merge request as inline comments
+  --comment              Ask the agent to post substantive review findings back
+                         to the target GitLab merge request as inline comments
+  --gitlab-mcp           Instruct the agent to use its installed GitLab MCP
+                         server for posting comments and resolving Duo threads.
+                         By default the agent is instructed to use the glab
+                         CLI instead.
   -h, --help             Show this help text
 
 Arguments:
@@ -47,8 +59,10 @@ Arguments:
 
 Notes:
   --resolve requires --duo.
-  GitLab features (MR URLs, --duo, --comment, --resolve) require curl, jq, and
-  GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
+  GitLab features (MR URLs, --duo, --comment, --resolve) need a working glab
+  CLI (run \`glab auth login\` once) and jq.
+  --gitlab-mcp requires the chosen agent to have a GitLab MCP server already
+  configured.
   Branch and MR URL reviews require a clean working tree.
   Existing local branches are only reused when they already match the fetched
   remote branch or can be fast-forwarded to it.
@@ -57,17 +71,17 @@ Notes:
 
 Examples:
   review
-    Print a review prompt for the current branch against main.
-  review --copilot
-    Pass the generated prompt for the current branch against main to GitHub Copilot CLI.
-  review --base feature/parent
-    Print a review prompt for the current branch against another branch for a stacked MR.
-  review feature/child
-    Fetch that remote branch, switch to it safely, and print the review prompt against main.
+    Run opencode with a review prompt for the current branch against main.
+  review --print
+    Print the review prompt for the current branch against main without invoking an agent.
+  review --claude --base feature/parent
+    Run Claude Code with a review prompt against another branch for a stacked MR.
+  review --copilot feature/child
+    Fetch that remote branch, switch to it safely, and run Copilot with the review prompt against main.
   review https://gitlab.com/group/project/-/merge_requests/124
-    Fetch that merge request, switch to its exact source branch state, and print the review prompt.
+    Fetch that merge request, switch to its exact source branch state, and run opencode with the review prompt.
   review --duo --comment
-    Print a prompt that includes unresolved GitLab Duo comments for the current branch's open MR and asks Copilot to comment findings back on it.
+    Run opencode with a prompt that includes unresolved GitLab Duo comments for the current branch's open MR and asks it to comment findings back on it.
 EOF
 }
 
@@ -211,12 +225,11 @@ urlencode() {
 }
 
 gitlab_get_with_base() {
-  api_base=$1
+  # First argument (legacy api_base) is ignored; glab picks the host from
+  # the current git repository.
   endpoint=$2
 
-  curl --silent --show-error --fail \
-    --header "PRIVATE-TOKEN: $gitlab_token" \
-    "$api_base/$endpoint"
+  glab api "$endpoint"
 }
 
 gitlab_get() {
@@ -242,22 +255,12 @@ resolve_base_ref() {
 }
 
 ensure_gitlab_prerequisites() {
-  require_command_with_help curl "Install it with Homebrew: brew install curl"
   require_command_with_help jq "Install it with Homebrew: brew install jq"
+  require_command_with_help glab "Install it with Homebrew: brew install glab, then run 'glab auth login'."
 
-  gitlab_token=${GITLAB_TOKEN-}
-  if [ -z "$gitlab_token" ]; then
-    gitlab_token=${GITLAB_ACCESS_TOKEN-}
-  fi
-
-  if [ -z "$gitlab_token" ]; then
+  if ! glab auth status >/dev/null 2>&1; then
     cat >&2 <<EOF
-review: GitLab options require GITLAB_TOKEN or GITLAB_ACCESS_TOKEN.
-
-Fix it by exporting one of them before running review, for example:
-  export GITLAB_TOKEN=<your-gitlab-token>
-
-Then rerun the command.
+review: glab is not authenticated. Run 'glab auth login' and try again.
 EOF
     exit 1
   fi
@@ -492,6 +495,8 @@ set_primary_merge_request_context_from_loaded() {
 
   mr_discussions_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
   mr_notes_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
+  mr_discussions_path="projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
+  mr_notes_path="projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
 }
 
 load_primary_merge_request_for_current_branch() {
@@ -547,6 +552,8 @@ load_primary_merge_request_for_current_branch() {
 
   mr_discussions_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
   mr_notes_endpoint="$gitlab_api_base/projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
+  mr_discussions_path="projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions"
+  mr_notes_path="projects/$encoded_project_path/merge_requests/$merge_request_iid/notes"
   primary_mr_context_loaded="true"
 }
 
@@ -554,6 +561,15 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --copilot)
       mode="copilot"
+      ;;
+    --opencode)
+      mode="opencode"
+      ;;
+    --claude)
+      mode="claude"
+      ;;
+    --print)
+      mode="prompt"
       ;;
     --duo)
       include_duo="true"
@@ -563,6 +579,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --comment)
       comment_on_mr="true"
+      ;;
+    --gitlab-mcp)
+      use_mcp="true"
       ;;
     --base)
       shift
@@ -684,7 +703,7 @@ if [ "$primary_mr_context_loaded" = "true" ]; then
   append_prompt "$mr_context"
 fi
 
-gitlab_shell_safety_context=$(printf "If you use shell commands for GitLab API calls, the shell safety scanner rejects any command containing the literal \`\${\` sequence, even inside quoted text, heredocs, or embedded JavaScript. Do not use \`\${...}\` shell expansion, \`\${...}\` fallback expressions, or JavaScript template literals in commands. Use plain \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN references after checking which variable is exported, use simple string concatenation, and paraphrase any reply or comment text that would otherwise contain the exact \`\${\` sequence.")
+gitlab_shell_safety_context=$(printf "If you use shell commands for GitLab API calls, the shell safety scanner rejects any command containing the literal \`\${\` sequence, even inside quoted text, heredocs, or embedded JavaScript. Do not use \`\${...}\` shell expansion or JavaScript template literals in such commands; prefer plain string concatenation and paraphrase any reply or comment text that would otherwise contain the exact \`\${\` sequence.")
 
 if [ "$include_duo" = "true" ]; then
   if ! discussions_json=$(gitlab_get "projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions?per_page=100"); then
@@ -747,10 +766,14 @@ if [ "$include_duo" = "true" ]; then
     ')
 
     if [ "$unresolved_duo_comments" -gt 0 ]; then
-      resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\n%s\n\nGitLab API for Duo replies:\n- Reply: POST %s/<discussion_id>/notes with form field body=<reply>\n- Resolve: PUT %s/<discussion_id>?resolved=true\n- Use whichever of \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN is already exported; avoid inline fallback expressions." \
-        "$gitlab_shell_safety_context" \
-        "$mr_discussions_endpoint" \
-        "$mr_discussions_endpoint")
+      if [ "$use_mcp" = "true" ]; then
+        resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\nUse your installed GitLab MCP server for all GitLab API actions (creating discussion replies and resolving discussions). The MCP server already knows the GitLab host and credentials. Do not shell out to curl or glab for these actions.")
+      else
+        resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\n%s\n\nUse the glab CLI (already authenticated) for all GitLab API actions. glab picks the correct host and credentials from the current git repository.\n- Reply to a Duo discussion:\n    glab api --method POST %s/<discussion_id>/notes --field body=<reply>\n- Resolve a Duo discussion:\n    glab api --method PUT '%s/<discussion_id>?resolved=true'\nDo not shell out to curl, and do not use a GitLab MCP server; glab is the only supported transport here." \
+          "$gitlab_shell_safety_context" \
+          "$mr_discussions_path" \
+          "$mr_discussions_path")
+      fi
       append_prompt "$resolve_context"
     else
       append_prompt "There are no unresolved GitLab Duo discussions to reply to or resolve."
@@ -759,19 +782,36 @@ if [ "$include_duo" = "true" ]; then
 fi
 
 if [ "$comment_on_mr" = "true" ]; then
-  comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\n%s\n\nGitLab API for inline diff comments:\n- Endpoint: POST %s\n- Auth header: PRIVATE-TOKEN: use whichever of \$GITLAB_TOKEN or \$GITLAB_ACCESS_TOKEN is already exported; avoid inline fallback expressions.\n- Required position fields for text diff comments:\n  body=<comment>\n  position[position_type]=text\n  position[base_sha]=%s\n  position[start_sha]=%s\n  position[head_sha]=%s\n  position[old_path]=<file path before the change>\n  position[new_path]=<file path after the change>\n  position[new_line]=<line number> for added or changed lines, or position[old_line]=<line number> for removed lines\n- When the file was not renamed, old_path and new_path are the same path.\n- If GitLab rejects the position, inspect the merge request diff metadata first and retry with a valid changed line instead of immediately falling back to a general note.\n- If a finding truly does not map to a changed line, post one concise general merge request note to: POST %s" \
-    "$gitlab_shell_safety_context" \
-    "$mr_discussions_endpoint" \
-    "$mr_base_sha" \
-    "$mr_start_sha" \
-    "$mr_head_sha" \
-    "$mr_notes_endpoint")
+  if [ "$use_mcp" = "true" ]; then
+    comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\nUse your installed GitLab MCP server for posting comments. The MCP server already knows the GitLab host and credentials. Use the merge request diff refs below when the MCP server needs them for inline positioning:\n  base_sha=%s\n  start_sha=%s\n  head_sha=%s\nFor a text-diff comment, supply the changed file path and the line number on the new side (or the old side for removed lines). When the file was not renamed, old_path and new_path are the same path. If the MCP server rejects the position, inspect the merge request diff metadata and retry with a valid changed line instead of immediately falling back to a general note. If a finding truly does not map to a changed line, post one concise general merge request note instead. Do not shell out to curl or glab for these actions." \
+      "$mr_base_sha" \
+      "$mr_start_sha" \
+      "$mr_head_sha")
+  else
+    comment_context=$(printf "Post substantive review findings directly to the target GitLab merge request as inline diff comments on the most relevant changed line. Only post real, actionable issues tied to the change. Skip style nits, speculative concerns, and duplicate threads. If there are no worthwhile findings, do not post any merge request comments.\n\n%s\n\nUse the glab CLI (already authenticated) for all GitLab API actions. glab picks the correct host and credentials from the current git repository. Do not shell out to curl, and do not use a GitLab MCP server; glab is the only supported transport here.\n\nInline diff comment:\n  glab api --method POST %s \\\\\n    --field body=<comment> \\\\\n    --field position[position_type]=text \\\\\n    --field position[base_sha]=%s \\\\\n    --field position[start_sha]=%s \\\\\n    --field position[head_sha]=%s \\\\\n    --field position[old_path]=<file path before the change> \\\\\n    --field position[new_path]=<file path after the change> \\\\\n    --field position[new_line]=<line number for added or changed lines>\nUse position[old_line] instead of position[new_line] for removed lines. When the file was not renamed, old_path and new_path are the same path.\n\nIf GitLab rejects the position, inspect the merge request diff metadata first and retry with a valid changed line instead of immediately falling back to a general note. If a finding truly does not map to a changed line, post one concise general merge request note:\n  glab api --method POST %s --field body=<comment>" \
+      "$gitlab_shell_safety_context" \
+      "$mr_discussions_path" \
+      "$mr_base_sha" \
+      "$mr_start_sha" \
+      "$mr_head_sha" \
+      "$mr_notes_path")
+  fi
   append_prompt "$comment_context"
 fi
 
 if [ "$mode" = "copilot" ]; then
-  require_command_with_help copilot "Install GitHub Copilot CLI or rerun without --copilot."
+  require_command_with_help copilot "Install GitHub Copilot CLI or rerun with --print, --opencode, or --claude."
   exec copilot -i "$prompt"
+fi
+
+if [ "$mode" = "opencode" ]; then
+  require_command_with_help opencode "Install opencode CLI or rerun with --print, --copilot, or --claude."
+  exec opencode run -i "$prompt"
+fi
+
+if [ "$mode" = "claude" ]; then
+  require_command_with_help claude "Install Claude Code CLI or rerun with --print, --copilot, or --opencode."
+  exec claude "$prompt"
 fi
 
 printf "%s\n" "$prompt"

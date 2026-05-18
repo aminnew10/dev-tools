@@ -2,11 +2,17 @@
 
 ## review
 
-`review` prints a review prompt for the current branch or a GitLab merge
-request. With `--copilot`, it passes that prompt to GitHub Copilot CLI. It can
-also use another branch or MR as the base for stacked reviews, include
-unresolved GitLab Duo comments, and instruct Copilot to comment back on the
-merge request.
+`review` generates a review prompt for the current branch or a GitLab merge
+request and passes it to a local coding agent. By default it uses
+[opencode](https://opencode.ai); use `--copilot` for GitHub Copilot CLI,
+`--claude` for Claude Code CLI, or `--print` to print the prompt instead of
+invoking an agent. All GitLab API calls made by `review` go through the
+[`glab`](https://gitlab.com/gitlab-org/cli) CLI, and the agent is instructed
+to use `glab` for any GitLab actions it takes. Pass `--gitlab-mcp` to instead
+instruct the agent to use its installed GitLab MCP server. It can also use
+another branch or MR as the base for stacked reviews, include unresolved
+GitLab Duo comments, and instruct the agent to comment back on the merge
+request.
 
 Install on macOS:
 
@@ -23,27 +29,41 @@ After installation:
 review --help
 ```
 
-GitLab-backed features need `curl`, `jq`, and either `GITLAB_TOKEN` or
-`GITLAB_ACCESS_TOKEN`.
+GitLab-backed features need a working
+[`glab`](https://gitlab.com/gitlab-org/cli) CLI (run `glab auth login` once)
+and `jq`. With `--gitlab-mcp` the agent is instructed to use its installed
+GitLab MCP server instead of `glab` for posting comments and resolving Duo
+threads; the script itself still uses `glab` for fetching merge request
+metadata.
 
 ### Options
 
 | Option | What it does |
 | --- | --- |
 | `<branch-name-or-merge-request-url>` | Reviews a specific remote branch or GitLab merge request by fetching it, switching to that branch safely, and ensuring the checked-out branch matches the remote exactly. |
-| `--copilot` | Passes the generated prompt to GitHub Copilot CLI. Without this flag, `review` prints the prompt. |
+| `--opencode` | Passes the generated prompt to opencode CLI. This is the default. |
+| `--copilot` | Passes the generated prompt to GitHub Copilot CLI. |
+| `--claude` | Passes the generated prompt to Claude Code CLI. |
+| `--print` | Prints the generated prompt instead of invoking an agent. |
 | `--base <ref>` | Uses another branch, commit hash, or GitLab merge request URL as the review base. |
 | `--duo` | Includes only unresolved GitLab Duo comments for the target merge request in the prompt. |
-| `--resolve` | With `--duo`, asks Copilot to reply to and resolve Duo comments that are not worth acting on. |
-| `--comment` | Asks Copilot to post substantive review findings back to the target merge request as comments. |
+| `--resolve` | With `--duo`, asks the agent to reply to and resolve Duo comments that are not worth acting on. |
+| `--comment` | Asks the agent to post substantive review findings back to the target merge request as comments. |
+| `--gitlab-mcp` | Instructs the agent to use its installed GitLab MCP server for posting comments and resolving Duo threads. Without this flag, the agent is told to use the `glab` CLI. |
 | `-h`, `--help` | Shows the built-in command help. |
 
 ### Usage examples
 
-Print a review prompt for the current branch against `main`:
+Run a review of the current branch against `main` with the default agent (opencode):
 
 ```sh
 review
+```
+
+Print the generated prompt instead of invoking an agent:
+
+```sh
+review --print
 ```
 
 Pass the generated prompt to GitHub Copilot CLI:
@@ -52,25 +72,31 @@ Pass the generated prompt to GitHub Copilot CLI:
 review --copilot
 ```
 
+Pass the generated prompt to Claude Code CLI:
+
+```sh
+review --claude
+```
+
 Review the current branch against another branch for a stacked merge request:
 
 ```sh
 review --base feature/parent
 ```
 
-Fetch a remote branch, switch to it, and print the review prompt against `main`:
+Fetch a remote branch, switch to it, and run the review against `main`:
 
 ```sh
 review feature/child
 ```
 
-Fetch a merge request branch, switch to its exact source branch state, and print the review prompt:
+Fetch a merge request branch, switch to its exact source branch state, and run the review:
 
 ```sh
 review https://gitlab.com/group/project/-/merge_requests/123
 ```
 
-Generate a prompt with unresolved GitLab Duo comments and instructions for Copilot to comment substantive findings back on the current branch's open merge request:
+Generate a prompt with unresolved GitLab Duo comments and instructions to comment substantive findings back on the current branch's open merge request:
 
 ```sh
 review --duo --comment
