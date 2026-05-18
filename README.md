@@ -50,6 +50,8 @@ metadata.
 | `--resolve` | With `--duo`, asks the agent to reply to and resolve Duo comments that are not worth acting on. |
 | `--comment` | Asks the agent to post substantive review findings back to the target merge request as comments. |
 | `--gitlab-mcp` | Instructs the agent to use its installed GitLab MCP server for posting comments and resolving Duo threads. Without this flag, the agent is told to use the `glab` CLI. |
+| `--model <model>` | Overrides the model used by the agent. Defaults: `gpt-5.5` for `--opencode` and `--copilot`, `sonnet` for `--claude`. With `--opencode` the value is forwarded as `github-copilot/<model>` unless it already contains `/`. |
+| `--effort <level>` | Overrides the reasoning effort. Defaults: `xhigh` for `--opencode` and `--copilot`, `max` for `--claude`. With `--opencode` this is passed as `--variant`. |
 | `-h`, `--help` | Shows the built-in command help. |
 
 ### Usage examples

@@ -15,11 +15,13 @@ need_gitlab_api="false"
 need_primary_mr_context="false"
 primary_mr_context_loaded="false"
 use_mcp="false"
+requested_model=""
+requested_effort=""
 
 usage() {
   cat <<EOF
 Usage:
-  review [--opencode|--copilot|--claude|--print] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [--gitlab-mcp] [<branch-name-or-merge-request-url>]
+  review [--opencode|--copilot|--claude|--print] [--model <model>] [--effort <level>] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [--gitlab-mcp] [<branch-name-or-merge-request-url>]
   review --help
 
 Generate a code review prompt for the current branch and pass it to a local
@@ -34,6 +36,13 @@ Options:
   --copilot              Pass the generated prompt to GitHub Copilot CLI
   --claude               Pass the generated prompt to Claude Code CLI
   --print                Print the generated prompt instead of invoking an agent
+  --model <model>        Override the agent model. Defaults: gpt-5.5 for
+                         --opencode and --copilot, sonnet for --claude.
+                         For --opencode the value is passed as
+                         github-copilot/<model> unless it already contains '/'.
+  --effort <level>       Override the reasoning effort. Defaults: xhigh for
+                         --opencode and --copilot, max for --claude. For
+                         --opencode this is forwarded as --variant.
   --base <ref>           Compare against the given base branch, commit hash, or
                          GitLab merge request URL. Useful for stacked merge
                          requests. Default: $default_base
@@ -583,6 +592,32 @@ while [ "$#" -gt 0 ]; do
     --gitlab-mcp)
       use_mcp="true"
       ;;
+    --model)
+      shift
+      if [ "$#" -eq 0 ]; then
+        fail "--model requires a model name"
+      fi
+      requested_model=$1
+      ;;
+    --model=*)
+      requested_model=${1#--model=}
+      if [ -z "$requested_model" ]; then
+        fail "--model requires a model name"
+      fi
+      ;;
+    --effort)
+      shift
+      if [ "$#" -eq 0 ]; then
+        fail "--effort requires a level"
+      fi
+      requested_effort=$1
+      ;;
+    --effort=*)
+      requested_effort=${1#--effort=}
+      if [ -z "$requested_effort" ]; then
+        fail "--effort requires a level"
+      fi
+      ;;
     --base)
       shift
       if [ "$#" -eq 0 ]; then
@@ -799,19 +834,38 @@ if [ "$comment_on_mr" = "true" ]; then
   append_prompt "$comment_context"
 fi
 
+case "$mode" in
+  opencode|copilot)
+    model=${requested_model:-gpt-5.5}
+    effort=${requested_effort:-xhigh}
+    ;;
+  claude)
+    model=${requested_model:-sonnet}
+    effort=${requested_effort:-max}
+    ;;
+  *)
+    model=$requested_model
+    effort=$requested_effort
+    ;;
+esac
+
 if [ "$mode" = "copilot" ]; then
   require_command_with_help copilot "Install GitHub Copilot CLI or rerun with --print, --opencode, or --claude."
-  exec copilot -i "$prompt"
+  exec copilot --model "$model" --effort "$effort" -i "$prompt"
 fi
 
 if [ "$mode" = "opencode" ]; then
   require_command_with_help opencode "Install opencode CLI or rerun with --print, --copilot, or --claude."
-  exec opencode run -i "$prompt"
+  case "$model" in
+    */*) opencode_model=$model ;;
+    *)   opencode_model="github-copilot/$model" ;;
+  esac
+  exec opencode run --model "$opencode_model" --variant "$effort" -i "$prompt"
 fi
 
 if [ "$mode" = "claude" ]; then
   require_command_with_help claude "Install Claude Code CLI or rerun with --print, --copilot, or --opencode."
-  exec claude "$prompt"
+  exec claude --model "$model" --effort "$effort" "$prompt"
 fi
 
 printf "%s\n" "$prompt"
