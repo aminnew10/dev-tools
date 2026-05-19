@@ -10,9 +10,8 @@ invoking an agent. All GitLab API calls made by `review` go through the
 [`glab`](https://gitlab.com/gitlab-org/cli) CLI, and the agent is instructed
 to use `glab` for any GitLab actions it takes. Pass `--gitlab-mcp` to instead
 instruct the agent to use its installed GitLab MCP server. It can also use
-another branch or MR as the base for stacked reviews, include unresolved
-GitLab Duo comments, and instruct the agent to comment back on the merge
-request.
+another branch or MR as the base for stacked reviews and instruct the agent
+to comment back on the merge request.
 
 Install on macOS:
 
@@ -32,9 +31,8 @@ review --help
 GitLab-backed features need a working
 [`glab`](https://gitlab.com/gitlab-org/cli) CLI (run `glab auth login` once)
 and `jq`. With `--gitlab-mcp` the agent is instructed to use its installed
-GitLab MCP server instead of `glab` for posting comments and resolving Duo
-threads; the script itself still uses `glab` for fetching merge request
-metadata.
+GitLab MCP server instead of `glab` for posting comments; the script itself
+still uses `glab` for fetching merge request metadata.
 
 ### Options
 
@@ -46,10 +44,8 @@ metadata.
 | `--claude` | Passes the generated prompt to Claude Code CLI. |
 | `--print` | Prints the generated prompt instead of invoking an agent. |
 | `--base <ref>` | Uses another branch, commit hash, or GitLab merge request URL as the review base. |
-| `--duo` | Includes only unresolved GitLab Duo comments for the target merge request in the prompt. |
-| `--resolve` | With `--duo`, asks the agent to reply to and resolve Duo comments that are not worth acting on. |
 | `--comment` | Asks the agent to post substantive review findings back to the target merge request as comments. |
-| `--gitlab-mcp` | Instructs the agent to use its installed GitLab MCP server for posting comments and resolving Duo threads. Without this flag, the agent is told to use the `glab` CLI. |
+| `--gitlab-mcp` | Instructs the agent to use its installed GitLab MCP server for posting comments. Without this flag, the agent is told to use the `glab` CLI. |
 | `--model <model>` | Overrides the model used by the agent. Defaults: `gpt-5.5` for `--opencode` and `--copilot`, `sonnet` for `--claude`. With `--opencode` the value is forwarded as `github-copilot/<model>` unless it already contains `/`. |
 | `--effort <level>` | Overrides the reasoning effort. Defaults: `xhigh` for `--opencode` and `--copilot`, `max` for `--claude`. With `--opencode` this is passed as `--variant`. |
 | `-h`, `--help` | Shows the built-in command help. |
@@ -98,10 +94,10 @@ Fetch a merge request branch, switch to its exact source branch state, and run t
 review https://gitlab.com/group/project/-/merge_requests/123
 ```
 
-Generate a prompt with unresolved GitLab Duo comments and instructions to comment substantive findings back on the current branch's open merge request:
+Generate a prompt with instructions to comment substantive findings back on the current branch's open merge request:
 
 ```sh
-review --duo --comment
+review --comment
 ```
 
 If `review` needs to switch branches for a branch or merge request review, keep

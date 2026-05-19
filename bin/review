@@ -6,8 +6,6 @@ requested_base="$default_base"
 requested_mr_url=""
 requested_review_branch=""
 mode="opencode"
-include_duo="false"
-resolve_duo="false"
 comment_on_mr="false"
 explicit_base="false"
 requested_base_is_mr_url="false"
@@ -21,7 +19,7 @@ requested_effort=""
 usage() {
   cat <<EOF
 Usage:
-  review [--opencode|--copilot|--claude|--print] [--model <model>] [--effort <level>] [--base <branch-or-commit-or-mr-url>] [--duo [--resolve]] [--comment] [--gitlab-mcp] [<branch-name-or-merge-request-url>]
+  review [--opencode|--copilot|--claude|--print] [--model <model>] [--effort <level>] [--base <branch-or-commit-or-mr-url>] [--comment] [--gitlab-mcp] [<branch-name-or-merge-request-url>]
   review --help
 
 Generate a code review prompt for the current branch and pass it to a local
@@ -46,16 +44,11 @@ Options:
   --base <ref>           Compare against the given base branch, commit hash, or
                          GitLab merge request URL. Useful for stacked merge
                          requests. Default: $default_base
-  --duo                  Find unresolved GitLab Duo comments for the target merge
-                         request and append them to the prompt
-  --resolve              With --duo, ask the agent to reply to and resolve Duo
-                         comments that are incorrect, irrelevant, or too nitpicky
   --comment              Ask the agent to post substantive review findings back
                          to the target GitLab merge request as inline comments
   --gitlab-mcp           Instruct the agent to use its installed GitLab MCP
-                         server for posting comments and resolving Duo threads.
-                         By default the agent is instructed to use the glab
-                         CLI instead.
+                         server for posting comments. By default the agent is
+                         instructed to use the glab CLI instead.
   -h, --help             Show this help text
 
 Arguments:
@@ -67,9 +60,8 @@ Arguments:
                          exact source branch, and then start the review
 
 Notes:
-  --resolve requires --duo.
-  GitLab features (MR URLs, --duo, --comment, --resolve) need a working glab
-  CLI (run \`glab auth login\` once) and jq.
+  GitLab features (MR URLs, --comment) need a working glab CLI
+  (run \`glab auth login\` once) and jq.
   --gitlab-mcp requires the chosen agent to have a GitLab MCP server already
   configured.
   Branch and MR URL reviews require a clean working tree.
@@ -89,8 +81,8 @@ Examples:
     Fetch that remote branch, switch to it safely, and run Copilot with the review prompt against main.
   review https://gitlab.com/group/project/-/merge_requests/124
     Fetch that merge request, switch to its exact source branch state, and run opencode with the review prompt.
-  review --duo --comment
-    Run opencode with a prompt that includes unresolved GitLab Duo comments for the current branch's open MR and asks it to comment findings back on it.
+  review --comment
+    Run opencode with a prompt for the current branch's open MR and ask it to comment findings back on it.
 EOF
 }
 
@@ -580,12 +572,6 @@ while [ "$#" -gt 0 ]; do
     --print)
       mode="prompt"
       ;;
-    --duo)
-      include_duo="true"
-      ;;
-    --resolve)
-      resolve_duo="true"
-      ;;
     --comment)
       comment_on_mr="true"
       ;;
@@ -653,10 +639,6 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-if [ "$resolve_duo" = "true" ] && [ "$include_duo" != "true" ]; then
-  fail "--resolve requires --duo"
-fi
-
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fail "not inside a Git repository"
 fi
@@ -665,7 +647,7 @@ if is_merge_request_url "$requested_base"; then
   requested_base_is_mr_url="true"
 fi
 
-if [ -n "$requested_mr_url" ] || [ "$include_duo" = "true" ] || [ "$comment_on_mr" = "true" ]; then
+if [ -n "$requested_mr_url" ] || [ "$comment_on_mr" = "true" ]; then
   need_primary_mr_context="true"
 fi
 
@@ -739,82 +721,6 @@ if [ "$primary_mr_context_loaded" = "true" ]; then
 fi
 
 gitlab_shell_safety_context=$(printf "If you use shell commands for GitLab API calls, the shell safety scanner rejects any command containing the literal \`\${\` sequence, even inside quoted text, heredocs, or embedded JavaScript. Do not use \`\${...}\` shell expansion or JavaScript template literals in such commands; prefer plain string concatenation and paraphrase any reply or comment text that would otherwise contain the exact \`\${\` sequence.")
-
-if [ "$include_duo" = "true" ]; then
-  if ! discussions_json=$(gitlab_get "projects/$encoded_project_path/merge_requests/$merge_request_iid/discussions?per_page=100"); then
-    fail "failed to load merge request discussions for !${merge_request_iid}. Check that your token can read discussions."
-  fi
-
-  duo_comments=$(printf '%s' "$discussions_json" | jq -r '
-    [
-      .[]
-      | .id as $discussion_id
-      | .notes[]
-      | select(.author.username == "GitLabDuo" and .resolvable == true and (.resolved // false) == false)
-      | {
-          discussion_id: $discussion_id,
-          note_id: (.id | tostring),
-          status: "unresolved",
-          location: (
-            if .position == null then
-              "general"
-            else
-              (.position.new_path // .position.old_path // "unknown")
-              + (
-                  if (.position.new_line // .position.old_line) != null then
-                    ":" + ((.position.new_line // .position.old_line) | tostring)
-                  else
-                    ""
-                  end
-                )
-            end
-          ),
-          body: .body
-        }
-    ]
-    | if length == 0 then
-        "No unresolved GitLab Duo comments were found on the target merge request."
-      else
-        map(
-          "- discussion " + .discussion_id
-          + ", note " + .note_id
-          + ", " + .status
-          + ", location: " + .location
-          + "\n" + .body
-        )
-        | join("\n\n")
-      end
-  ')
-
-  duo_context=$(printf "GitLab Duo comments can be useful hints, but validate them against the actual code and behavior because some may be incorrect, irrelevant, or overly nitpicky. Only unresolved GitLab Duo comments are included below; resolved comments are intentionally ignored.\n\nEach entry below includes the GitLab discussion ID, note ID, status, and location.\n\nGitLab Duo comments:\n%s" \
-    "$duo_comments")
-  append_prompt "$duo_context"
-
-  if [ "$resolve_duo" = "true" ]; then
-    unresolved_duo_comments=$(printf '%s' "$discussions_json" | jq '
-      [
-        .[]
-        | .notes[]
-        | select(.author.username == "GitLabDuo" and .resolvable == true and (.resolved // false) == false)
-      ]
-      | length
-    ')
-
-    if [ "$unresolved_duo_comments" -gt 0 ]; then
-      if [ "$use_mcp" = "true" ]; then
-        resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\nUse your installed GitLab MCP server for all GitLab API actions (creating discussion replies and resolving discussions). The MCP server already knows the GitLab host and credentials. Do not shell out to curl or glab for these actions.")
-      else
-        resolve_context=$(printf "Also evaluate the unresolved GitLab Duo discussions above. For each Duo discussion that is incorrect, irrelevant, or too nitpicky, reply in the merge request thread with a concise explanation and resolve it. Do not resolve valid comments unless you address them with code changes or a clear rationale. Keep replies short and factual.\n\n%s\n\nUse the glab CLI (already authenticated) for all GitLab API actions. glab picks the correct host and credentials from the current git repository.\n- Reply to a Duo discussion:\n    glab api --method POST %s/<discussion_id>/notes --field body=<reply>\n- Resolve a Duo discussion:\n    glab api --method PUT '%s/<discussion_id>?resolved=true'\nDo not shell out to curl, and do not use a GitLab MCP server; glab is the only supported transport here." \
-          "$gitlab_shell_safety_context" \
-          "$mr_discussions_path" \
-          "$mr_discussions_path")
-      fi
-      append_prompt "$resolve_context"
-    else
-      append_prompt "There are no unresolved GitLab Duo discussions to reply to or resolve."
-    fi
-  fi
-fi
 
 if [ "$comment_on_mr" = "true" ]; then
   if [ "$use_mcp" = "true" ]; then
